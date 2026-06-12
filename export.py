@@ -17,9 +17,13 @@ Tailored to the on-device TensorRT path
     length ``top_k``); the C++ frontend thresholds on score instead. With a
     static image size this yields a fully static engine — TensorRT's happy path.
 
-  * Output bindings: ``keypoints`` (1, K, 2), ``descriptors`` (1, K, 64),
-    ``scores`` (1, K) — the names/shapes okvis_xfeat_frontend::TensorRTEngine
-    binds. Keeping the batch dim means they drop straight into LighterGlue.
+  * Output bindings: ``keypoints`` (1, K, 2) **int32 pixel coords**,
+    ``descriptors`` (1, K, 64) float, ``scores`` (1, K) float — the names/shapes
+    okvis_xfeat_frontend::TensorRTEngine binds. Keeping the batch dim means they
+    drop straight into LighterGlue. Keypoints are int32 (not float) so the engine
+    is fp16-safe: a float coord output lets TRT lower the full-res index-decode
+    (idx up to H*W) to fp16, where it overflows to ±inf; an integer decode stays
+    int32. The C++ readback reads int32 and casts to float pixels.
 
 C++ preprocessing contract (matches what this graph expects): XFeat does NOT
 divide by 255 and applies no mean/std normalisation (InstanceNorm inside the net
@@ -47,11 +51,23 @@ OPSET_DEFAULT = 18
 class XFeatExtractorStatic(nn.Module):
     """XFeat detect+describe with static, fixed-``top_k`` outputs for TensorRT.
 
-    A faithful copy of ``XFeat.detectAndCompute`` with two export-oriented
-    changes only:
-      * the final ``valid = scores > 0`` boolean mask is dropped (no NonZero);
-      * the in-place ``scores[...] = -1`` becomes ``torch.where`` (trace-safe).
-    Invalid slots keep score -1 and keypoint (0, 0); the consumer filters them.
+    Upstream ``XFeat.detectAndCompute`` is unfriendly to a static TensorRT engine
+    in two ways, both fixed here:
+
+      * ``NMS`` returns *every* local-max pixel via ``.nonzero()`` — a
+        data-dependent count (tens of thousands on noise). That makes the output
+        shape dynamic, and the subsequent ``argsort`` over all candidates lowers
+        to a TensorRT TopK with K = candidate-count, which blows past TRT's hard
+        **TopK K ≤ 3840** limit (observed: K=37729).
+      * the trailing ``scores > 0`` boolean mask is another ``NonZero``.
+
+    Reformulation: max-pool suppression → a single bounded ``torch.topk`` (K =
+    ``top_k`` ≤ 3840) on the flattened heatmap. No NonZero anywhere → fully static
+    ``[1, top_k, *]`` outputs, and the TopK stays within the TRT limit. Selection
+    is by keypoint-heatmap value (upstream sorts by the reliability-weighted score,
+    which would require materialising all candidates first); the reliability-
+    weighted score is still computed and emitted, and padding slots (fewer than
+    ``top_k`` real maxima) get score -1 for the consumer to drop.
     """
 
     def __init__(self, xfeat: XFeat):
@@ -60,41 +76,63 @@ class XFeatExtractorStatic(nn.Module):
 
     def forward(self, x):
         xf = self.xfeat
-        x, rh1, rw1 = xf.preprocess_tensor(x)
+        # rh/rw (resize ratios) are unused: static export forces H,W % 32 == 0,
+        # so preprocess_tensor is a no-op and the engine input == original image.
+        x, _, _ = xf.preprocess_tensor(x)
         _, _, _H1, _W1 = x.shape
 
         M1, K1, H1 = xf.net(x)
         M1 = F.normalize(M1, dim=1)
 
-        K1h = xf.get_kpts_heatmap(K1)
-        mkpts = xf.NMS(K1h)
+        K1h = xf.get_kpts_heatmap(K1)            # [B, 1, _H1, _W1]
+        B, _, _Hh, Wh = K1h.shape
+
+        # Static NMS + top_k: suppress non-maxima, then one bounded TopK.
+        local_max = F.max_pool2d(K1h, kernel_size=5, stride=1, padding=2)
+        is_max = (K1h == local_max).to(K1h.dtype)
+        scored = (K1h * is_max).reshape(B, -1)   # [B, Hh*Wh], non-maxima -> 0
+        heat_vals, idx = torch.topk(scored, xf.top_k, dim=-1)  # [B, K], K<=3840
+
+        # Decode flat TopK indices → (x,y) via a constant coordinate LUT gather,
+        # NOT div/mod arithmetic on the index. TRT miscompiles the int div/mod
+        # decode: in fp16 the index (up to H*W ≈ 1.02M) overflows to ±inf; in
+        # int32 the raw index leaks through as the coordinate (observed u up to
+        # ~1.02e6). A Gather from a baked [H*W] table is exact in any engine
+        # precision — no index arithmetic for TRT to mangle. // ADR-0040.
+        yy, xx = torch.meshgrid(
+            torch.arange(_Hh, device=K1h.device),
+            torch.arange(Wh, device=K1h.device), indexing="ij")
+        xs_lut = xx.reshape(-1).to(torch.int32)   # col per flat position
+        ys_lut = yy.reshape(-1).to(torch.int32)   # row per flat position
+        xs = xs_lut[idx]                          # [B,K] int32 — Gather
+        ys = ys_lut[idx]
+        mkpts = torch.stack([xs.to(K1h.dtype), ys.to(K1h.dtype)], dim=-1)  # [B,K,2]
 
         _nearest = InterpolateSparse2d("nearest")
         _bilinear = InterpolateSparse2d("bilinear")
         scores = (_nearest(K1h, mkpts, _H1, _W1) *
                   _bilinear(H1, mkpts, _H1, _W1)).squeeze(-1)
-        # Mark padding keypoints (0,0) invalid — torch.where keeps this exportable.
-        scores = torch.where(
-            torch.all(mkpts == 0, dim=-1),
-            torch.tensor(-1.0, dtype=scores.dtype, device=scores.device),
-            scores,
-        )
-
-        # Fixed top_k selection — output length is constant, no masking.
-        idxs = torch.argsort(-scores)
-        mkpts_x = torch.gather(mkpts[..., 0], -1, idxs)[:, : xf.top_k]
-        mkpts_y = torch.gather(mkpts[..., 1], -1, idxs)[:, : xf.top_k]
-        mkpts = torch.cat([mkpts_x[..., None], mkpts_y[..., None]], dim=-1)
-        scores = torch.gather(scores, -1, idxs)[:, : xf.top_k]
+        # Padding slots (no real maximum) -> score -1 so the consumer drops them.
+        scores = torch.where(heat_vals > 0, scores,
+                             torch.full_like(scores, -1.0))
 
         feats = xf.interpolator(M1, mkpts, H=_H1, W=_W1)
         feats = F.normalize(feats, dim=-1)
 
-        # Map keypoints back to original-image pixel coords (unity when H,W % 32 == 0).
-        mkpts = mkpts * torch.tensor(
-            [rw1, rh1], device=mkpts.device).view(1, 1, -1)
+        # Output keypoints as INT32 pixel coords (xs, ys). This is a correctness
+        # requirement under fp16, not a style choice: XFeat decodes coordinates
+        # from a flattened TopK index `idx` that runs to H*W ≈ 1.02M. Any FLOAT
+        # output branch lets TRT lower that decode to fp16, where idx overflows to
+        # ±inf (fp16 max ≈ 65504) — observed on-device as all-inf keypoints while
+        # the fp32-anchored score branch stayed correct. A NORMALIZED float output
+        # does NOT fix it (the overflow is upstream of the divide). Keeping the
+        # decode integer-typed all the way to the binding means TRT runs it in
+        # int32 (indices < 2^31, exact) regardless of engine precision: fp16-safe
+        # by construction. The C++ readback reads int32 and casts to float pixels.
+        # // ADR-0040 (fp16 keypoint-coord fix).
+        keypoints = torch.stack([xs, ys], dim=-1).to(torch.int32)  # [B,K,2] px
 
-        return mkpts, feats, scores  # (1,K,2) (1,K,64) (1,K)
+        return keypoints, feats, scores  # (1,K,2) int32 px (1,K,64) (1,K)
 
 
 def _try_simplify(path: str) -> None:
@@ -151,8 +189,9 @@ def _verify(path: str, model: nn.Module, height: int, width: int,
     print("  [verify] onnx outputs:",
           ", ".join(f"{n}{list(o.shape)}" for n, o in zip(names, (ok, _, osc))))
 
+    # Keypoints are int32 pixel coords.
     def kset(k, s):
-        return {(int(round(a)), int(round(b)))
+        return {(int(a), int(b))
                 for (a, b), sc in zip(k[0], s[0]) if sc > 0}
 
     A, B = kset(tk, ts), kset(ok, osc)
@@ -255,6 +294,8 @@ def parse_args():
     args = p.parse_args()
     if not args.dynamic and (args.height % 32 or args.width % 32):
         p.error("static export needs height & width to be multiples of 32")
+    if args.top_k > 3840:
+        p.error("top_k must be <= 3840 (TensorRT TopK hard limit)")
     return args
 
 
