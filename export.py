@@ -1,307 +1,267 @@
 #!/usr/bin/env python3
-"""Export XFeat (+ optional LighterGlue) to ONNX for the Mow-e VIO frontend.
+"""Reproducible XFeat + LighterGlue ONNX export for the Mow-e VIO front-end (T-0109).
 
-Tailored to the on-device TensorRT path
-(tools/test-board/okvis2-mowe/okvis_xfeat_frontend):
+    export.py --model xfeat       --hw 640x384 --k 1024 --out ../../../out/onnx
+    export.py --model lighterglue --k 512              --out ../../../out/onnx
 
-  * MONO input (1, 1, H, W). The OV9281 is an 8-bit mono global-shutter sensor;
-    XFeat averages channels to one immediately (model.py: ``x.mean(dim=1)``) and
-    its first conv is ``Conv2d(1, 24, ...)``, so a single-channel input is
-    loss-free and lets the CUDA preprocess kernel emit a one-plane buffer with no
-    RGB expansion. (RGB still works via --channels 3 if ever needed.)
+Writes ``<out>/xfeat_<W>x<H>_k<K>.onnx`` / ``<out>/lighterglue_k<K>.onnx`` and
+updates ``manifest.json`` (filename -> sha256, resolution, K, opset, exporter
+git hash + sha256, date) next to this script.
 
-  * STATIC output shapes. Upstream ``detectAndCompute`` ends with
-    ``mkpts[scores > 0]`` — a boolean mask that compiles to a ``NonZero`` op with
-    a data-dependent output length, which TensorRT handles poorly. We export a
-    wrapper that keeps the fixed ``top_k`` set (keypoints/descriptors/scores all
-    length ``top_k``); the C++ frontend thresholds on score instead. With a
-    static image size this yields a fully static engine — TensorRT's happy path.
+Contracts (mowe-nav-kb 02 §XFeat output, 03 §static shapes + padding mask):
 
-  * Output bindings: ``keypoints`` (1, K, 2) **int32 pixel coords**,
-    ``descriptors`` (1, K, 64) float, ``scores`` (1, K) float — the names/shapes
-    okvis_xfeat_frontend::TensorRTEngine binds. Keeping the batch dim means they
-    drop straight into LighterGlue. Keypoints are int32 (not float) so the engine
-    is fp16-safe: a float coord output lets TRT lower the full-res index-decode
-    (idx up to H*W) to fp16, where it overflows to ±inf; an integer decode stays
-    int32. The C++ readback reads int32 and casts to float pixels.
+* **XFeat extractor** — input ``images[2,1,H,W]`` float32, raw 0..255 mono, NCHW.
+  Batch is fixed at 2: the stereo pair goes through one enqueue (KB 03 §batching).
+  XFeat applies no /255 or mean/std (InstanceNorm inside the net handles scale)
+  and its first conv is ``Conv2d(1, 24, ...)`` after ``x.mean(dim=1)``, so a
+  single channel is loss-free for the OV9281 (mono, 1280x800; ADR-0005).
+  H and W must be multiples of 32 so XFeat's internal /32 resize is a no-op and
+  the keypoint scale correction is unity.  Outputs, all static:
+  ``keypoints[2,K,2]`` int32 pixel (x, y), ``descriptors[2,K,64]`` float32
+  L2-normalised, ``scores[2,K]`` float32 with **-1 in padding slots** (fewer
+  than K local maxima above the detection threshold).  Keypoints are int32, not
+  float, on purpose: the flat top-K index runs to H*W ≈ 1.02 M and an fp16
+  TensorRT engine overflows a float decode to ±inf (observed on device); an
+  integer Gather from a baked coordinate LUT is exact in any precision
+  (ADR-0040).  No ``NonZero`` anywhere: NMS is max-pool suppression followed by
+  one bounded ``TopK`` (K ≤ 3840, TensorRT's hard TopK limit).  Ranking follows
+  upstream ``detectAndCompute``: reliability-weighted score
+  (keypoint heatmap × bilinearly-upsampled reliability map), threshold 0.05.
 
-C++ preprocessing contract (matches what this graph expects): XFeat does NOT
-divide by 255 and applies no mean/std normalisation (InstanceNorm inside the net
-handles scale). The CUDA kernel must emit float pixels in the raw 0..255 range,
-NCHW, single channel, at exactly (H, W) below (a multiple of 32 so XFeat's
-internal /32 resize is a no-op and the keypoint scale correction is unity).
+* **LighterGlue split matcher** — inputs ``kpts0[1,K,2]``, ``kpts1[1,K,2]``
+  float32 keypoints normalised as kornia's ``normalize_keypoints`` does
+  (``(xy - size/2) / (max(size)/2)``, i.e. roughly [-1, 1]);
+  ``desc0/desc1[1,K,64]`` float32; ``scores0/scores1[1,K]`` float32 as emitted
+  by the extractor.  Validity is ``score > 0``: invalid (padding) points are
+  masked out of every self-/cross-attention key set and out of the assignment
+  matrix, so padding cannot corrupt real matches (KB 03 §padding).  Outputs
+  ``matches0[1,K]`` int32 (index into set 1, or -1) and ``mscores0[1,K]``
+  float32 — fixed shape, mutual-nearest + threshold applied inside the graph.
+  Full 6-layer weights (``xfeat-lighterglue.pt`` has layers 0..5; the old L3
+  export silently ran a truncated net).  Early exit / point pruning do not
+  survive export; the graph runs full depth.
+
+Opset 18 throughout (LighterGlue needs ≥ 18; TensorRT 10.3 reads it natively).
 """
 import argparse
+import datetime as _dt
+import hashlib
+import json
 import os
+import subprocess
+import sys
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from modules.xfeat import XFeat
-from modules.interpolator import InterpolateSparse2d
-from modules.lighterglue import LighterGlue
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from modules.xfeat import XFeat  # noqa: E402
+from modules.interpolator import InterpolateSparse2d  # noqa: E402
+from modules.lighterglue import LighterGlue  # noqa: E402
+from modules import lightglue as _lg  # noqa: E402
 
-
-# opset 18: LighterGlue needs ≥18, and TensorRT 10.3 supports it natively — no
-# fragile down-conversion. The extractor is fine at 18 too.
-OPSET_DEFAULT = 18
+OPSET = 18
+TRT_TOPK_MAX = 3840
+STEREO_BATCH = 2  # KB 03 §batching: left+right in one enqueue
 
 
 class XFeatExtractorStatic(nn.Module):
-    """XFeat detect+describe with static, fixed-``top_k`` outputs for TensorRT.
-
-    Upstream ``XFeat.detectAndCompute`` is unfriendly to a static TensorRT engine
-    in two ways, both fixed here:
-
-      * ``NMS`` returns *every* local-max pixel via ``.nonzero()`` — a
-        data-dependent count (tens of thousands on noise). That makes the output
-        shape dynamic, and the subsequent ``argsort`` over all candidates lowers
-        to a TensorRT TopK with K = candidate-count, which blows past TRT's hard
-        **TopK K ≤ 3840** limit (observed: K=37729).
-      * the trailing ``scores > 0`` boolean mask is another ``NonZero``.
-
-    Reformulation: max-pool suppression → a single bounded ``torch.topk`` (K =
-    ``top_k`` ≤ 3840) on the flattened heatmap. No NonZero anywhere → fully static
-    ``[1, top_k, *]`` outputs, and the TopK stays within the TRT limit. Selection
-    is by keypoint-heatmap value (upstream sorts by the reliability-weighted score,
-    which would require materialising all candidates first); the reliability-
-    weighted score is still computed and emitted, and padding slots (fewer than
-    ``top_k`` real maxima) get score -1 for the consumer to drop.
-    """
+    """XFeat detect+describe with static ``[B,K,*]`` outputs (see module doc)."""
 
     def __init__(self, xfeat: XFeat):
         super().__init__()
         self.xfeat = xfeat
+        self._nearest = InterpolateSparse2d("nearest")
+        self._bilinear = InterpolateSparse2d("bilinear")
 
     def forward(self, x):
         xf = self.xfeat
-        # rh/rw (resize ratios) are unused: static export forces H,W % 32 == 0,
-        # so preprocess_tensor is a no-op and the engine input == original image.
+        # H,W % 32 == 0 is enforced by the CLI, so preprocess_tensor is a no-op.
         x, _, _ = xf.preprocess_tensor(x)
-        _, _, _H1, _W1 = x.shape
+        B, _, H, W = x.shape
 
         M1, K1, H1 = xf.net(x)
         M1 = F.normalize(M1, dim=1)
+        K1h = xf.get_kpts_heatmap(K1)  # [B,1,H,W]
 
-        K1h = xf.get_kpts_heatmap(K1)            # [B, 1, _H1, _W1]
-        B, _, _Hh, Wh = K1h.shape
-
-        # Static NMS + top_k: suppress non-maxima, then one bounded TopK.
+        # Static NMS: max-pool suppression + detection threshold (upstream NMS),
+        # ranked by the same reliability-weighted score upstream sorts on.
         local_max = F.max_pool2d(K1h, kernel_size=5, stride=1, padding=2)
-        is_max = (K1h == local_max).to(K1h.dtype)
-        scored = (K1h * is_max).reshape(B, -1)   # [B, Hh*Wh], non-maxima -> 0
-        heat_vals, idx = torch.topk(scored, xf.top_k, dim=-1)  # [B, K], K<=3840
+        is_max = (K1h == local_max) & (K1h > xf.detection_threshold)
+        H1_up = F.interpolate(H1, (H, W), mode="bilinear", align_corners=False)
+        ranked = torch.where(is_max, K1h * H1_up, torch.zeros_like(K1h))
+        rank_vals, idx = torch.topk(ranked.reshape(B, -1), xf.top_k, dim=-1)
 
-        # Decode flat TopK indices → (x,y) via a constant coordinate LUT gather,
-        # NOT div/mod arithmetic on the index. TRT miscompiles the int div/mod
-        # decode: in fp16 the index (up to H*W ≈ 1.02M) overflows to ±inf; in
-        # int32 the raw index leaks through as the coordinate (observed u up to
-        # ~1.02e6). A Gather from a baked [H*W] table is exact in any engine
-        # precision — no index arithmetic for TRT to mangle. // ADR-0040.
-        yy, xx = torch.meshgrid(
-            torch.arange(_Hh, device=K1h.device),
-            torch.arange(Wh, device=K1h.device), indexing="ij")
-        xs_lut = xx.reshape(-1).to(torch.int32)   # col per flat position
-        ys_lut = yy.reshape(-1).to(torch.int32)   # row per flat position
-        xs = xs_lut[idx]                          # [B,K] int32 — Gather
-        ys = ys_lut[idx]
-        mkpts = torch.stack([xs.to(K1h.dtype), ys.to(K1h.dtype)], dim=-1)  # [B,K,2]
+        # Flat index -> (x, y) by Gather from a constant LUT (no div/mod: ADR-0040).
+        yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
+        xs = xx.reshape(-1).to(torch.int32)[idx]
+        ys = yy.reshape(-1).to(torch.int32)[idx]
+        mkpts = torch.stack([xs, ys], dim=-1).to(K1h.dtype)  # [B,K,2]
 
-        _nearest = InterpolateSparse2d("nearest")
-        _bilinear = InterpolateSparse2d("bilinear")
-        scores = (_nearest(K1h, mkpts, _H1, _W1) *
-                  _bilinear(H1, mkpts, _H1, _W1)).squeeze(-1)
-        # Padding slots (no real maximum) -> score -1 so the consumer drops them.
-        scores = torch.where(heat_vals > 0, scores,
-                             torch.full_like(scores, -1.0))
-
-        feats = xf.interpolator(M1, mkpts, H=_H1, W=_W1)
-        feats = F.normalize(feats, dim=-1)
-
-        # Output keypoints as INT32 pixel coords (xs, ys). This is a correctness
-        # requirement under fp16, not a style choice: XFeat decodes coordinates
-        # from a flattened TopK index `idx` that runs to H*W ≈ 1.02M. Any FLOAT
-        # output branch lets TRT lower that decode to fp16, where idx overflows to
-        # ±inf (fp16 max ≈ 65504) — observed on-device as all-inf keypoints while
-        # the fp32-anchored score branch stayed correct. A NORMALIZED float output
-        # does NOT fix it (the overflow is upstream of the divide). Keeping the
-        # decode integer-typed all the way to the binding means TRT runs it in
-        # int32 (indices < 2^31, exact) regardless of engine precision: fp16-safe
-        # by construction. The C++ readback reads int32 and casts to float pixels.
-        # // ADR-0040 (fp16 keypoint-coord fix).
-        keypoints = torch.stack([xs, ys], dim=-1).to(torch.int32)  # [B,K,2] px
-
-        return keypoints, feats, scores  # (1,K,2) int32 px (1,K,64) (1,K)
+        scores = (self._nearest(K1h, mkpts, H, W) *
+                  self._bilinear(H1, mkpts, H, W)).squeeze(-1)
+        scores = torch.where(rank_vals > 0, scores, torch.full_like(scores, -1.0))
+        feats = F.normalize(xf.interpolator(M1, mkpts, H=H, W=W), dim=-1)
+        keypoints = torch.stack([xs, ys], dim=-1)  # int32 px
+        return keypoints, feats, scores
 
 
-def _try_simplify(path: str) -> None:
-    """Best-effort onnx-simplifier. Skipped (with a note) if unavailable/fails —
-    the raw graph is still valid; simplification is an optimisation only."""
+class MaskedAttention(nn.Module):
+    """Drop-in for lightglue.Attention that masks padded keys (KB 03 §padding).
+
+    LightGlue reuses one attention module for both directions of a block
+    (self: set 0 then set 1; cross: keys of set 1 then set 0), so the masks are
+    consumed in call order; ``reset`` is called once per forward.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.masks, self.i = [None, None], 0
+
+    def reset(self, first, second):
+        self.masks, self.i = [first, second], 0
+
+    def forward(self, q, k, v):
+        mask = self.masks[self.i % 2]
+        self.i += 1
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+
+class LighterGlueSplit(nn.Module):
+    """LighterGlue over two padded sets with a score-derived validity mask."""
+
+    def __init__(self, weights: str):
+        super().__init__()
+        self.net = LighterGlue(n_layers=6, weights=weights).net.eval()
+        for layer in self.net.transformers:
+            layer.self_attn.inner_attn = MaskedAttention()
+            layer.cross_attn.inner_attn = MaskedAttention()
+        self.threshold = self.net.conf.filter_threshold
+
+    def forward(self, kpts0, kpts1, desc0, desc1, scores0, scores1):
+        net = self.net
+        valid0, valid1 = scores0 > 0, scores1 > 0
+        m0, m1 = valid0[:, None, None, :], valid1[:, None, None, :]  # [B,1,1,N] key masks
+        d0, d1 = net.input_proj(desc0), net.input_proj(desc1)
+        e0, e1 = net.posenc(kpts0), net.posenc(kpts1)
+        for layer in net.transformers:
+            layer.self_attn.inner_attn.reset(m0, m1)
+            layer.cross_attn.inner_attn.reset(m1, m0)
+            d0, d1 = layer(d0, d1, e0, e1)
+        scores = net.log_assignment[-1](d0, d1)  # [B,M,N] log assignment
+        invalid = ~(valid0[:, :, None] & valid1[:, None, :])
+        scores = scores.masked_fill(invalid, -1e9)
+        # Mutual nearest neighbour + threshold, all static shape (no NonZero).
+        max0_val, m0i = scores.max(2)          # [B,M]
+        _, m1i = scores.max(1)                 # [B,N]
+        idx = torch.arange(m0i.shape[1])[None]
+        mutual = (idx == m1i.gather(1, m0i)) & valid0
+        mscores0 = torch.where(mutual, max0_val.exp(), torch.zeros_like(max0_val))
+        ok = mscores0 > self.threshold
+        matches0 = torch.where(ok, m0i, torch.full_like(m0i, -1)).to(torch.int32)
+        return matches0, mscores0
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _git_hash():
     try:
-        import onnx
-        from onnxsim import simplify
-    except Exception as e:  # noqa: BLE001
-        print(f"  [sim] skipped (onnxsim unavailable: {e})")
-        return
-    try:
-        model_simp, ok = simplify(onnx.load(path))
-        if ok:
-            onnx.save(model_simp, path)
-            print("  [sim] simplified OK")
-        else:
-            print("  [sim] simplifier could not validate; keeping raw graph")
-    except Exception as e:  # noqa: BLE001
-        print(f"  [sim] failed ({e}); keeping raw graph")
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=HERE, text=True).strip()
+        dirty = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "export.py", "modules"],
+                               cwd=HERE).returncode != 0
+        return sha + ("-dirty" if dirty else "")
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
 
-def _verify(path: str, model: nn.Module, height: int, width: int,
-            channels: int) -> None:
-    """Faithfulness check: torch wrapper vs onnxruntime on a REAL image, comparing
-    the *set* of valid keypoints. Positional comparison is meaningless here —
-    argsort ties (esp. the score=-1 padding) get ordered differently across
-    backends, so identical keypoint sets can still differ slot-by-slot. Set-IoU
-    is the right invariant. Needs a real image (random noise has too many ties)."""
-    try:
-        import cv2
-        import numpy as np
-        import onnxruntime as ort
-    except Exception as e:  # noqa: BLE001
-        print(f"  [verify] skipped (missing dep: {e})")
-        return
-
-    sample = next((c for c in ("assets/ref.png", "assets/tgt.png")
-                   if os.path.exists(c)), None)
-    if sample is None:
-        print("  [verify] no sample image under assets/ — skipped")
-        return
-    im = cv2.resize(cv2.imread(sample, cv2.IMREAD_GRAYSCALE),
-                    (width, height)).astype(np.float32)  # raw 0..255 mono
-    t = torch.from_numpy(im)[None, None]
-    if channels == 3:
-        t = t.repeat(1, 3, 1, 1)
-
+def _export(model, args_tuple, path, input_names, output_names, opset):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with torch.no_grad():
-        tk, _, ts = (a.cpu().numpy() for a in model(t))
-    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-    ok, _, osc = sess.run(None, {"images": t.numpy()})
-    names = [o.name for o in sess.get_outputs()]
-    print("  [verify] onnx outputs:",
-          ", ".join(f"{n}{list(o.shape)}" for n, o in zip(names, (ok, _, osc))))
-
-    # Keypoints are int32 pixel coords.
-    def kset(k, s):
-        return {(int(a), int(b))
-                for (a, b), sc in zip(k[0], s[0]) if sc > 0}
-
-    A, B = kset(tk, ts), kset(ok, osc)
-    iou = len(A & B) / max(len(A | B), 1)
-    sdiff = float(np.max(np.abs(np.sort(ts[0]) - np.sort(osc[0]))))
-    flag = "OK" if iou > 0.99 else "WARN"
-    print(f"  [verify] {flag} valid kpts torch={len(A)} onnx={len(B)}  "
-          f"IoU={iou:.4f}  scores max|Δ|={sdiff:.2e}")
+        torch.onnx.export(model, args_tuple, path, input_names=input_names,
+                          output_names=output_names, opset_version=opset,
+                          do_constant_folding=True, dynamo=False)
+    import onnx
+    from onnxsim import simplify  # folds the static-shape residue (If/Shape/Range) — deterministic
+    m, ok = simplify(onnx.load(path))
+    if not ok:
+        raise SystemExit(f"{path}: onnxsim could not validate the simplified graph")
+    onnx.checker.check_model(m)
+    onnx.save(m, path)
+    bad = sorted({n.op_type for n in m.graph.node if n.op_type == "NonZero"})
+    if bad:
+        raise SystemExit(f"{path}: graph contains {bad} — data-dependent shape, refusing")
 
 
-def export_extractor(args) -> str:
-    xfeat = XFeat(weights=args.weights, top_k=args.top_k,
-                  detection_threshold=args.detection_threshold).eval()
-    model = XFeatExtractorStatic(xfeat).eval()
+def _update_manifest(path, entry):
+    mpath = os.path.join(HERE, "manifest.json")
+    manifest = json.load(open(mpath)) if os.path.exists(mpath) else {}
+    manifest[os.path.basename(path)] = dict(
+        sha256=_sha256(path), size_bytes=os.path.getsize(path), opset=OPSET,
+        exporter_git=_git_hash(), exporter_sha256=_sha256(os.path.abspath(__file__)),
+        torch=torch.__version__, date=_dt.date.today().isoformat(), **entry)
+    with open(mpath, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"[manifest] {os.path.basename(path)} sha256={manifest[os.path.basename(path)]['sha256'][:12]}…")
 
-    dummy = torch.randn(1, args.channels, args.height, args.width)
-    print(f"[extractor] input {tuple(dummy.shape)}  top_k={args.top_k}  "
-          f"{'dynamic' if args.dynamic else 'static'}")
 
-    output_names = ["keypoints", "descriptors", "scores"]
-    dynamic_axes = None
-    if args.dynamic:
-        dynamic_axes = {
-            "images": {2: "height", 3: "width"},
-            "keypoints": {1: "num_keypoints"},
-            "descriptors": {1: "num_keypoints"},
-            "scores": {1: "num_keypoints"},
-        }
-        fname = f"xfeat_mono_dynamic_{args.top_k}.onnx"
+def build_xfeat(k, weights_dir=os.path.join(HERE, "weights")):
+    xf = XFeat(weights=os.path.join(weights_dir, "xfeat.pt"), top_k=k).eval()
+    return XFeatExtractorStatic(xf).eval()
+
+
+def build_lighterglue(weights_dir=os.path.join(HERE, "weights")):
+    return LighterGlueSplit(os.path.join(weights_dir, "xfeat-lighterglue.pt")).eval()
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", choices=("xfeat", "lighterglue"), required=True)
+    p.add_argument("--hw", default="640x384", help="WIDTHxHEIGHT, multiples of 32 (xfeat only)")
+    p.add_argument("--k", type=int, required=True, help="fixed top-K (≤ 3840)")
+    p.add_argument("--out", default="onnx", help="output directory for .onnx")
+    p.add_argument("--weights-dir", default=os.path.join(HERE, "weights"))
+    a = p.parse_args(argv)
+    if a.k > TRT_TOPK_MAX:
+        p.error(f"--k must be <= {TRT_TOPK_MAX} (TensorRT TopK limit)")
+    torch.manual_seed(0)
+
+    if a.model == "xfeat":
+        w, h = (int(v) for v in a.hw.lower().split("x"))
+        if w % 32 or h % 32:
+            p.error("--hw must be multiples of 32 (XFeat /32 resize must be a no-op)")
+        path = os.path.join(a.out, f"xfeat_{w}x{h}_k{a.k}.onnx")
+        model = build_xfeat(a.k, a.weights_dir)
+        dummy = torch.rand(STEREO_BATCH, 1, h, w) * 255
+        _export(model, (dummy,), path, ["images"], ["keypoints", "descriptors", "scores"], OPSET)
+        _update_manifest(path, dict(model="xfeat", width=w, height=h, k=a.k, batch=STEREO_BATCH,
+                                    input="images[2,1,H,W] float32 raw 0..255 mono",
+                                    outputs="keypoints[2,K,2] int32 px, descriptors[2,K,64], scores[2,K] (-1 = padding)",
+                                    weights_sha256=_sha256(os.path.join(a.weights_dir, "xfeat.pt"))))
     else:
-        fname = f"xfeat_mono_{args.top_k}_{args.height}x{args.width}.onnx"
-    if args.channels != 1:
-        fname = fname.replace("mono", f"c{args.channels}")
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    path = os.path.join(args.output_dir, fname)
-
-    torch.onnx.export(
-        model, dummy, path,
-        input_names=["images"], output_names=output_names,
-        opset_version=args.opset, do_constant_folding=True,
-        dynamic_axes=dynamic_axes,
-    )
-    print(f"[extractor] wrote {path}")
-    _try_simplify(path)
-    _verify(path, model, args.height, args.width, args.channels)
-    return path
-
-
-def export_matcher(args) -> str:
-    matcher = LighterGlue(n_layers=args.lighterglue_layers).eval()
-    k = args.top_k
-    kpts = torch.rand(1, k, 2, dtype=torch.float32) * 2 - 1
-    desc = torch.rand(1, k, 64, dtype=torch.float32)
-
-    dynamic_axes = None
-    if args.dynamic:
-        dynamic_axes = {
-            "kpts0": {1: "num_keypoints0"}, "kpts1": {1: "num_keypoints1"},
-            "desc0": {1: "num_keypoints0"}, "desc1": {1: "num_keypoints1"},
-            "matches": {0: "num_matches"}, "scores": {0: "num_matches"},
-        }
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    path = os.path.join(args.output_dir,
-                        f"lighterglue_L{args.lighterglue_layers}.onnx")
-    print(f"[matcher] LighterGlue L{args.lighterglue_layers}  kpts={k}")
-    torch.onnx.export(
-        matcher, (kpts, kpts, desc, desc), path,
-        input_names=["kpts0", "kpts1", "desc0", "desc1"],
-        output_names=["matches", "scores"],
-        opset_version=args.opset, do_constant_folding=True,
-        dynamic_axes=dynamic_axes,
-    )
-    print(f"[matcher] wrote {path}")
-    _try_simplify(path)
-    return path
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--weights", default="weights/xfeat.pt",
-                   help="XFeat .pt weights")
-    p.add_argument("--output-dir", default="onnx")
-    p.add_argument("--height", type=int, default=800,
-                   help="input height (multiple of 32; OV9281 native is 800)")
-    p.add_argument("--width", type=int, default=1280,
-                   help="input width (multiple of 32; OV9281 native is 1280)")
-    p.add_argument("--channels", type=int, default=1, choices=(1, 3),
-                   help="1 = mono (OV9281, default), 3 = RGB")
-    p.add_argument("--top-k", type=int, default=2048)
-    p.add_argument("--detection-threshold", type=float, default=0.05)
-    p.add_argument("--opset", type=int, default=OPSET_DEFAULT)
-    p.add_argument("--dynamic", action="store_true",
-                   help="export dynamic shapes (default: static — better for TRT)")
-    p.add_argument("--lighterglue-layers", type=int, default=3)
-    p.add_argument("--no-extractor", action="store_true")
-    p.add_argument("--no-matcher", action="store_true")
-    args = p.parse_args()
-    if not args.dynamic and (args.height % 32 or args.width % 32):
-        p.error("static export needs height & width to be multiples of 32")
-    if args.top_k > 3840:
-        p.error("top_k must be <= 3840 (TensorRT TopK hard limit)")
-    return args
+        path = os.path.join(a.out, f"lighterglue_k{a.k}.onnx")
+        model = build_lighterglue(a.weights_dir)
+        kp = torch.rand(1, a.k, 2) * 2 - 1
+        de = F.normalize(torch.randn(1, a.k, 64), dim=-1)
+        sc = torch.rand(1, a.k)
+        sc[:, -a.k // 8:] = -1  # exercise the padding path in the traced graph
+        _export(model, (kp, kp.clone(), de, de.clone(), sc, sc.clone()), path,
+                ["kpts0", "kpts1", "desc0", "desc1", "scores0", "scores1"],
+                ["matches0", "mscores0"], OPSET)
+        _update_manifest(path, dict(model="lighterglue", k=a.k, layers=6, threshold=model.threshold,
+                                    input="kpts[1,K,2] normalised (kornia normalize_keypoints), desc[1,K,64], scores[1,K] (>0 valid)",
+                                    outputs="matches0[1,K] int32 (-1 = none), mscores0[1,K]",
+                                    weights_sha256=_sha256(os.path.join(a.weights_dir, "xfeat-lighterglue.pt"))))
+    print(f"[export] wrote {path}")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    if not args.no_extractor:
-        export_extractor(args)
-    if not args.no_matcher:
-        export_matcher(args)
+    main()

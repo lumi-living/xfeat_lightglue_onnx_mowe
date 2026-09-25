@@ -1,5 +1,10 @@
-opencv-contrib-python-headless==4.10.0.84
-poselib
-kornia==0.7.2
-tqdm
-gdown
+# T-0109 export + test environment (CPU-only torch is enough: export and
+# onnxruntime verification only; engines are built on the Jetson with trtexec).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.4
+numpy
+onnx
+onnxruntime
+opencv-contrib-python-headless
+pytest
+onnxsim
