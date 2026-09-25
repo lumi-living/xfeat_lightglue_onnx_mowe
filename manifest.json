@@ -1,8 +1,8 @@
 {
   "lighterglue_k512.onnx": {
     "date": "2026-09-25",
-    "exporter_git": "b2a4e8e1972a34594ba87847b1f2152a383a2ba7",
-    "exporter_sha256": "50b69e8680c254bde0ad6c1bf7617203a5479fe5d707cdecdac50f520e083d8b",
+    "exporter_git": "18001579ee9a8b9e6b0cc0b29d05fa6cbf1512d6",
+    "exporter_sha256": "36286aa30c6cac9116176d01a56d9dce2f7b87980abe72511667cf0813f0c8b3",
     "input": "kpts[1,K,2] normalised (kornia normalize_keypoints), desc[1,K,64], scores[1,K] (>0 valid)",
     "k": 512,
     "layers": 6,
@@ -18,8 +18,8 @@
   "xfeat_1280x800_k1024.onnx": {
     "batch": 2,
     "date": "2026-09-25",
-    "exporter_git": "b2a4e8e1972a34594ba87847b1f2152a383a2ba7",
-    "exporter_sha256": "50b69e8680c254bde0ad6c1bf7617203a5479fe5d707cdecdac50f520e083d8b",
+    "exporter_git": "18001579ee9a8b9e6b0cc0b29d05fa6cbf1512d6",
+    "exporter_sha256": "36286aa30c6cac9116176d01a56d9dce2f7b87980abe72511667cf0813f0c8b3",
     "height": 800,
     "input": "images[2,1,H,W] float32 raw 0..255 mono",
     "k": 1024,
@@ -35,8 +35,8 @@
   "xfeat_512x512_k1024.onnx": {
     "batch": 2,
     "date": "2026-09-25",
-    "exporter_git": "b2a4e8e1972a34594ba87847b1f2152a383a2ba7",
-    "exporter_sha256": "50b69e8680c254bde0ad6c1bf7617203a5479fe5d707cdecdac50f520e083d8b",
+    "exporter_git": "18001579ee9a8b9e6b0cc0b29d05fa6cbf1512d6",
+    "exporter_sha256": "36286aa30c6cac9116176d01a56d9dce2f7b87980abe72511667cf0813f0c8b3",
     "height": 512,
     "input": "images[2,1,H,W] float32 raw 0..255 mono",
     "k": 1024,
@@ -52,8 +52,8 @@
   "xfeat_640x384_k1024.onnx": {
     "batch": 2,
     "date": "2026-09-25",
-    "exporter_git": "b2a4e8e1972a34594ba87847b1f2152a383a2ba7",
-    "exporter_sha256": "50b69e8680c254bde0ad6c1bf7617203a5479fe5d707cdecdac50f520e083d8b",
+    "exporter_git": "18001579ee9a8b9e6b0cc0b29d05fa6cbf1512d6",
+    "exporter_sha256": "36286aa30c6cac9116176d01a56d9dce2f7b87980abe72511667cf0813f0c8b3",
     "height": 384,
     "input": "images[2,1,H,W] float32 raw 0..255 mono",
     "k": 1024,
