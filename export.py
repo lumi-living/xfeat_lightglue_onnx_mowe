@@ -174,7 +174,9 @@ def _sha256(path):
 
 def _git_hash():
     try:
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=HERE, text=True).strip()
+        # Last commit touching the exporter (not HEAD): committing manifest.json must not change it.
+        sha = subprocess.check_output(["git", "log", "-1", "--format=%H", "--", "export.py", "modules"],
+                                      cwd=HERE, text=True).strip()
         dirty = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "export.py", "modules"],
                                cwd=HERE).returncode != 0
         return sha + ("-dirty" if dirty else "")
