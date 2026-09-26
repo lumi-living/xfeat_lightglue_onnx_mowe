@@ -65,5 +65,22 @@
     "torch": "2.12.0+cpu",
     "weights_sha256": "0f5187fd7bedd26c7fe6acc9685444493a165a35ecc087b33c2db3627f3ea10b",
     "width": 640
+  },
+  "xfeat_736x480_k1024.onnx": {
+    "batch": 2,
+    "date": "2026-09-26",
+    "exporter_git": "18001579ee9a8b9e6b0cc0b29d05fa6cbf1512d6",
+    "exporter_sha256": "36286aa30c6cac9116176d01a56d9dce2f7b87980abe72511667cf0813f0c8b3",
+    "height": 480,
+    "input": "images[2,1,H,W] float32 raw 0..255 mono",
+    "k": 1024,
+    "model": "xfeat",
+    "opset": 18,
+    "outputs": "keypoints[2,K,2] int32 px, descriptors[2,K,64], scores[2,K] (-1 = padding)",
+    "sha256": "fc6a4320b43daf05b4d9d987ec3fbb2db20de814836dc106de3b0489dd140af8",
+    "size_bytes": 8326102,
+    "torch": "2.12.0+cpu",
+    "weights_sha256": "0f5187fd7bedd26c7fe6acc9685444493a165a35ecc087b33c2db3627f3ea10b",
+    "width": 736
   }
 }
