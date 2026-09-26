@@ -58,6 +58,13 @@ def desc_cosine_at_shared(kp_a, de_a, kp_b, de_b):
     return (de_a[ok] * de_b[j[ok]]).sum(-1)
 
 
+def offsets_agree_at_shared(kp_a, of_a, kp_b, of_b):
+    d = np.linalg.norm(kp_a[:, None, :] - kp_b[None, :, :], axis=-1)
+    j = d.argmin(1)
+    ok = d[np.arange(len(kp_a)), j] == 0
+    return float(np.abs(of_a[ok] - of_b[j[ok]]).max()) if ok.any() else 0.0
+
+
 def _session(fname):
     path = os.path.join(ONNX_DIR, fname)
     if not os.path.exists(path):
@@ -76,7 +83,7 @@ def test_xfeat_onnx_matches_torch(fname, manifest):
     w, h, k = m["width"], m["height"], m["k"]
     sess = _session(fname)
     assert [i.shape for i in sess.get_inputs()] == [[2, 1, h, w]]
-    assert [o.shape for o in sess.get_outputs()] == [[2, k, 2], [2, k, 64], [2, k]]
+    assert [o.shape for o in sess.get_outputs()] == [[2, k, 2], [2, k, 64], [2, k], [2, k, 2]]
     model = export.build_xfeat(k)
     ious, cos_min, cos_mean, counts, ious_up = [], [], [], [], []
     for i, name in enumerate(IMAGES):
@@ -84,12 +91,16 @@ def test_xfeat_onnx_matches_torch(fname, manifest):
         other = IMAGES[(i + 1) % len(IMAGES)]
         x = np.stack([load(name, w, h), load(other, w, h)])[:, None]
         with torch.no_grad():
-            tk, td, ts = (t.numpy() for t in model(torch.from_numpy(x)))
-        ok, od, osc = sess.run(None, {"images": x})
-        assert ok.dtype == np.int32 and osc.dtype == np.float32
+            tk, td, ts, tof = (t.numpy() for t in model(torch.from_numpy(x)))
+        ok, od, osc, oof = sess.run(None, {"images": x})
+        assert ok.dtype == np.int32 and osc.dtype == np.float32 and oof.dtype == np.float32
+        # T-0114 sub-pixel offsets: strictly inside (-1, 1), zero in padding
+        # slots, and ONNX agrees with torch at shared keypoints.
+        assert (np.abs(oof) < 1).all() and (oof[osc < 0] == 0).all() and (np.abs(oof[osc > 0]) > 0).any()
         for b in range(2):
             ka, ma = valid_sets(tk[b], ts[b])
             kb, mb = valid_sets(ok[b], osc[b])
+            assert offsets_agree_at_shared(ka, tof[b][ma], kb, oof[b][mb]) <= 0.05
             iou = set_iou(ka, kb)
             cos = desc_cosine_at_shared(ka, td[b][ma], kb, od[b][mb])
             ious.append(iou); cos_min.append(float(cos.min())); cos_mean.append(float(cos.mean()))
@@ -127,7 +138,7 @@ def test_lighterglue_onnx_matches_torch():
     for a, b in PAIRS:
         x = np.stack([load(a, w, h), load(b, w, h)])[:, None]
         with torch.no_grad():
-            kp, de, sc = (t.numpy() for t in ext(torch.from_numpy(x)))
+            kp, de, sc, _ = (t.numpy() for t in ext(torch.from_numpy(x)))
         kp = _normalise(kp.astype(np.float32), w, h)
         # Exercise the padding path: drop the weakest 1/8 of set 1 by score.
         sc1 = sc[1].copy(); sc1[np.argsort(sc1)[: k // 8]] = -1.0

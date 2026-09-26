@@ -19,7 +19,12 @@ Contracts (mowe-nav-kb 02 §XFeat output, 03 §static shapes + padding mask):
   the keypoint scale correction is unity.  Outputs, all static:
   ``keypoints[2,K,2]`` int32 pixel (x, y), ``descriptors[2,K,64]`` float32
   L2-normalised, ``scores[2,K]`` float32 with **-1 in padding slots** (fewer
-  than K local maxima above the detection threshold).  Keypoints are int32, not
+  than K local maxima above the detection threshold), ``offsets[2,K,2]``
+  float32 sub-pixel (dx, dy) in (-1, 1) engine px — centre of mass of the 3x3
+  heatmap neighbourhood, 0 in padding slots (T-0114: integer keypoints at
+  640x384 quantise the full-res row to 2.08 px and fail a 2 px epipolar
+  tolerance; descriptors are still sampled at the integer peak).  The refined
+  position is ``keypoints + offsets``.  Keypoints are int32, not
   float, on purpose: the flat top-K index runs to H*W ≈ 1.02 M and an fp16
   TensorRT engine overflows a float decode to ±inf (observed on device); an
   integer Gather from a baked coordinate LUT is exact in any precision
@@ -105,7 +110,28 @@ class XFeatExtractorStatic(nn.Module):
         scores = torch.where(rank_vals > 0, scores, torch.full_like(scores, -1.0))
         feats = F.normalize(xf.interpolator(M1, mkpts, H=H, W=W), dim=-1)
         keypoints = torch.stack([xs, ys], dim=-1)  # int32 px
-        return keypoints, feats, scores
+
+        # Sub-pixel refinement (T-0114): centre of mass of the 3x3 heatmap
+        # neighbourhood around each integer peak, as an offset in (-1, 1) px.
+        # Kept separate from `keypoints` so the coordinate stays an exact int32
+        # gather and the offset is small enough to survive fp16 (a float
+        # keypoint ~640 has 0.5 px resolution in fp16). Zero-padded border, 0 in
+        # padding slots. Nine flat Gathers, no data-dependent shapes.
+        Wp = W + 2
+        flat = F.pad(K1h, (1, 1, 1, 1)).reshape(B, -1)
+        centre = (ys.to(torch.int64) + 1) * Wp + (xs.to(torch.int64) + 1)
+        wsum = torch.zeros_like(rank_vals)
+        ox = torch.zeros_like(rank_vals)
+        oy = torch.zeros_like(rank_vals)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                v = torch.gather(flat, 1, centre + dy * Wp + dx)
+                wsum = wsum + v
+                ox = ox + dx * v
+                oy = oy + dy * v
+        offsets = torch.stack([ox / wsum, oy / wsum], dim=-1)
+        offsets = torch.where((rank_vals > 0)[..., None], offsets, torch.zeros_like(offsets))
+        return keypoints, feats, scores, offsets
 
 
 class MaskedAttention(nn.Module):
@@ -243,10 +269,10 @@ def main(argv=None):
         path = os.path.join(a.out, f"xfeat_{w}x{h}_k{a.k}.onnx")
         model = build_xfeat(a.k, a.weights_dir)
         dummy = torch.rand(STEREO_BATCH, 1, h, w) * 255
-        _export(model, (dummy,), path, ["images"], ["keypoints", "descriptors", "scores"], OPSET)
+        _export(model, (dummy,), path, ["images"], ["keypoints", "descriptors", "scores", "offsets"], OPSET)
         _update_manifest(path, dict(model="xfeat", width=w, height=h, k=a.k, batch=STEREO_BATCH,
                                     input="images[2,1,H,W] float32 raw 0..255 mono",
-                                    outputs="keypoints[2,K,2] int32 px, descriptors[2,K,64], scores[2,K] (-1 = padding)",
+                                    outputs="keypoints[2,K,2] int32 px, descriptors[2,K,64], scores[2,K] (-1 = padding), offsets[2,K,2] sub-px (-1,1)",
                                     weights_sha256=_sha256(os.path.join(a.weights_dir, "xfeat.pt"))))
     else:
         path = os.path.join(a.out, f"lighterglue_k{a.k}.onnx")
